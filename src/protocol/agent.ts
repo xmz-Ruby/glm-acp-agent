@@ -974,6 +974,18 @@ export class GlmAcpAgent implements Agent {
         session.displayText.set(userMessage, displayText);
       }
 
+      // Occupancy at turn start, before the model runs: a context gauge
+      // (Codeg's composer ring) lights up from the first turn's opening
+      // instead of only after it completes. Later updates overwrite it.
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          size: getContextWindow(session.model),
+          used: estimateMessagesTokens(session.messages),
+        },
+      });
+
       const { stopReason, usage } = await this.runPromptLoop(
         params.sessionId,
       session,
@@ -1015,16 +1027,16 @@ export class GlmAcpAgent implements Agent {
       // ACP's experimental usage channel: context occupancy for clients that
       // render a context-window gauge (Codeg's session footer, for one). Token
       // totals travel separately on the prompt response's `usage` field.
-      if (usage) {
-        await safeSessionUpdate(this.connection, {
-          sessionId: params.sessionId,
-          update: {
-            sessionUpdate: "usage_update",
-            size: getContextWindow(session.model),
-            used: estimateMessagesTokens(session.messages),
-          },
-        });
-      }
+      // Unconditional: occupancy is an estimate, so it stays honest even when
+      // the model stream carried no usage counters.
+      await safeSessionUpdate(this.connection, {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          size: getContextWindow(session.model),
+          used: estimateMessagesTokens(session.messages),
+        },
+      });
 
       this.persistSession(params.sessionId, session);
 
