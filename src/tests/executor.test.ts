@@ -1999,3 +1999,62 @@ test("image_analysis is unavailable when no vision client is configured", async 
   );
   assert.match(result.content, /vision[^.]*not configured/i);
 });
+
+// ---------------------------------------------------------------------------
+// Delegation report file-artifact mirroring (get_delegation_status)
+// ---------------------------------------------------------------------------
+
+test("get_delegation_status mirrors reported change-list files as synthetic tool calls", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "deleg-artifacts-exec-"));
+  const changed = join(dir, "AGENTS.md");
+  writeFileSync(changed, "hello", "utf8");
+  const created = join(dir, "generated.txt");
+  const conn = createConnectionStub();
+  const report = `## 变更清单\n- \`${changed}\` 两处替换\n- \`${created}\` 新建`;
+  const mcp = {
+    hasTool: (name: string) => name === "get_delegation_status",
+    callTool: async () => ({
+      content: [{ type: "text", text: envelopeText(report) }],
+    }),
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, mcp as never);
+  const result = await exec.execute("call-1", "get_delegation_status", "{}");
+  assert.ok(result.content.includes("t-1"));
+
+  const synthetic = conn.updates
+    .map((u) => u.update as Record<string, unknown>)
+    .filter((u) => u["sessionUpdate"] === "tool_call" && u["toolCallId"] !== "call-1");
+  assert.equal(synthetic.length, 2);
+  assert.equal(synthetic[0]!["title"], `Edit file: ${changed}`);
+  assert.deepEqual(synthetic[0]!["rawInput"], { file_path: changed });
+  assert.equal(synthetic[1]!["title"], `Write file: ${created}`);
+
+  const completions = conn.updates
+    .map((u) => u.update as Record<string, unknown>)
+    .filter(
+      (u) =>
+        u["sessionUpdate"] === "tool_call_update" &&
+        typeof u["toolCallId"] === "string" &&
+        u["toolCallId"].startsWith("delegated-")
+    );
+  assert.equal(completions.length, 2);
+});
+
+test("other session MCP tools emit no synthetic file tool calls", async () => {
+  const conn = createConnectionStub();
+  const mcp = {
+    hasTool: (name: string) => name === "check_user_feedback",
+    callTool: async () => ({ content: [{ type: "text", text: "{}" }] }),
+  };
+  const exec = new ToolExecutor(conn as never, "s1", FULL_CAPS, undefined, null, mcp as never);
+  await exec.execute("call-1", "check_user_feedback", "{}");
+  const announcements = conn.updates
+    .map((u) => u.update as Record<string, unknown>)
+    .filter((u) => u["sessionUpdate"] === "tool_call");
+  assert.equal(announcements.length, 1);
+  assert.equal(announcements[0]!["title"], "check_user_feedback");
+});
+
+function envelopeText(report: string): string {
+  return JSON.stringify({ tasks: [{ task_id: "t-1", status: "completed", text: report }] });
+}

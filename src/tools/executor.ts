@@ -12,6 +12,10 @@ import {
   ZAI_WEB_READER_MCP_ENDPOINT,
   ZAI_WEB_SEARCH_MCP_ENDPOINT,
 } from "./zai-mcp-client.js";
+import {
+  extractDelegationReports,
+  planFileArtifacts,
+} from "./delegation-artifacts.js";
 import type { SessionMcpTools } from "./session-mcp-client.js";
 import type { VisionMcpClient } from "./vision-mcp-client.js";
 import type { SessionModeId } from "../protocol/agent.js";
@@ -1069,11 +1073,60 @@ export class ToolExecutor {
           rawOutput: mcpResult,
         },
       });
+      if (toolName === "get_delegation_status") {
+        await this.emitDelegationFileArtifacts(text);
+      }
       return { content: text };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       await this.markFailed(toolCallId, message);
       return { content: `Error calling MCP tool ${toolName}: ${message}` };
+    }
+  }
+
+  /**
+   * Mirror files a delegated sub-agent changed into this transcript as
+   * synthetic edit/write tool calls, so the client's per-reply file cards
+   * include them. Display-only: nothing is appended to the model history.
+   */
+  private async emitDelegationFileArtifacts(resultText: string): Promise<void> {
+    try {
+      for (const report of extractDelegationReports(resultText)) {
+        for (const artifact of planFileArtifacts(report.taskId, report.text)) {
+          const filePath = String(artifact.rawInput["file_path"] ?? "");
+          await this.connection.sessionUpdate({
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: "tool_call",
+              toolCallId: artifact.toolCallId,
+              title: artifact.title,
+              kind: "edit",
+              status: "in_progress",
+              locations: [{ path: filePath }],
+              rawInput: artifact.rawInput,
+            },
+          });
+          await this.connection.sessionUpdate({
+            sessionId: this.sessionId,
+            update: {
+              sessionUpdate: "tool_call_update",
+              toolCallId: artifact.toolCallId,
+              status: "completed",
+              content: [{
+                type: "content",
+                content: {
+                  type: "text",
+                  text: `Changed by delegated sub-agent task ${report.taskId}; recorded from its report.`,
+                },
+              }],
+              rawOutput: elideForPreview({ source: "delegation", task_id: report.taskId }),
+            },
+          });
+        }
+      }
+    } catch {
+      // A cosmetic mirror of the child session's writes must never fail the
+      // real get_delegation_status result.
     }
   }
 
