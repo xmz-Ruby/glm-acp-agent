@@ -1052,9 +1052,12 @@ export class GlmAcpAgent implements Agent {
         return cancelledResponse();
       }
       // Surface the error to the user as an agent message so the IDE displays
-      // something instead of a silent JSON-RPC error.
+      // something instead of a silent JSON-RPC error. The same note joins the
+      // provider history and is checkpointed to disk: an interrupted turn must
+      // survive a process restart, not vanish with the in-memory session.
       const message = err instanceof Error ? err.message : String(err);
       if (ownsPrompt()) {
+        session.messages.push({ role: "assistant", content: `\n\n[error] ${message}` });
         await safeSessionUpdate(this.connection, {
           sessionId: params.sessionId,
           update: {
@@ -1062,6 +1065,7 @@ export class GlmAcpAgent implements Agent {
             content: { type: "text", text: `\n\n[error] ${message}` },
           },
         });
+        this.persistSession(params.sessionId, session);
       }
       throw err;
     } finally {

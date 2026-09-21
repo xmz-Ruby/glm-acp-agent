@@ -2820,6 +2820,54 @@ test("prompt persists session state to the SessionStore", async () => {
   }
 });
 
+test("prompt error checkpoints the interrupted turn to the SessionStore", async () => {
+  const { store, cleanup } = makeTempStore();
+  try {
+    const conn = createConnectionStub();
+    let calls = 0;
+    const glm = {
+      async *streamChat(): AsyncGenerator<GlmStreamChunk> {
+        calls++;
+        if (calls === 1) {
+          yield {
+            toolCall: {
+              id: "tc-interrupted",
+              name: "todowrite",
+              arguments: JSON.stringify({
+                todos: [{ content: "step one", status: "completed" }],
+              }),
+            },
+          };
+          yield { done: true, stopReason: "tool_calls" };
+          return;
+        }
+        throw new Error("429 rate limit exceeded");
+      },
+    };
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd: "/tmp", mcpServers: [] });
+
+    await assert.rejects(
+      agent.prompt({ sessionId, prompt: [{ type: "text", text: "do the thing" }] }),
+      /429 rate limit exceeded/
+    );
+
+    const persisted = store.load(sessionId);
+    assert.ok(persisted, "expected interrupted session to be persisted");
+    const roles = persisted?.messages.map((m) => m.role);
+    // system + user + assistant(tool_calls) + tool + assistant [error] note
+    assert.deepEqual(roles, ["system", "user", "assistant", "tool", "assistant"]);
+    const note = persisted?.messages.find(
+      (m) => m.role === "assistant" && typeof m.content === "string" && m.content.includes("[error]")
+    );
+    assert.ok(note, "expected the [error] note in persisted history");
+    assert.match(String(note?.content), /429 rate limit exceeded/);
+  } finally {
+    cleanup();
+  }
+});
+
 test("loadSession restores messages and replays them as session updates", async () => {
   const { store, cleanup } = makeTempStore();
   try {
