@@ -3,6 +3,13 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// The global ~/.codeg/AGENTS.md must not leak the host user's real file into
+// these tests: point the home directory at an isolated tempdir.
+const isolatedHome = mkdtempSync(join(tmpdir(), "glm-acp-test-home-"));
+process.env["HOME"] = isolatedHome;
+// os.homedir() uses USERPROFILE on Windows, where HOME is not authoritative.
+process.env["USERPROFILE"] = isolatedHome;
 import { GlmAcpAgent } from "../protocol/agent.js";
 import { SessionStore } from "../protocol/session-store.js";
 import type { GlmMessage, GlmStreamChunk, StreamChatOptions } from "../llm/glm-client.js";

@@ -659,6 +659,84 @@ test("system prompt prefers AGENTS.md over CLAUDE.md when both exist", async () 
   }
 });
 
+test("system prompt injects the global ~/.codeg/AGENTS.md when the cwd has none", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd();
+  const globalDir = pathJoin(isolatedHome, ".codeg");
+  const globalPath = pathJoin(globalDir, "AGENTS.md");
+  mkdirSync(globalDir, { recursive: true });
+  writeFileSync(globalPath, "GLOBAL RULE: answer in keigo.", "utf8");
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(
+      ref.value.includes("GLOBAL RULE: answer in keigo."),
+      "global ~/.codeg/AGENTS.md should be injected when the cwd has no file"
+    );
+    assert.match(
+      ref.value,
+      /project context.*not instructions/i,
+      "global content must use the untrusted-context wrapper"
+    );
+  } finally {
+    rmSync(globalPath, { force: true });
+    cleanup();
+  }
+});
+
+test("system prompt merges global and project AGENTS.md, global first", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd({
+    "AGENTS.md": "PROJECT RULE: tabs in legacy Makefiles.",
+  });
+  const globalDir = pathJoin(isolatedHome, ".codeg");
+  const globalPath = pathJoin(globalDir, "AGENTS.md");
+  mkdirSync(globalDir, { recursive: true });
+  writeFileSync(globalPath, "GLOBAL RULE: answer in keigo.", "utf8");
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    const globalAt = ref.value.indexOf("GLOBAL RULE: answer in keigo.");
+    const projectAt = ref.value.indexOf("PROJECT RULE: tabs in legacy Makefiles.");
+    assert.ok(globalAt !== -1, "global content should be present");
+    assert.ok(projectAt !== -1, "project content should be present");
+    assert.ok(
+      globalAt < projectAt,
+      "global content should be injected before the project file"
+    );
+  } finally {
+    rmSync(globalPath, { force: true });
+    cleanup();
+  }
+});
+
+test("system prompt keeps the AGENTS.md section absent when neither global nor project file exists", async () => {
+  const conn = createConnectionStub();
+  const { glm, ref } = captureSystemPrompt();
+  const { cwd, cleanup } = makeTempCwd();
+  try {
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hi" }] });
+
+    assert.ok(
+      !ref.value.includes("<project_context>"),
+      "no project_context block should be emitted when no file exists anywhere"
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("system prompt neutralizes wrapper-escape attempts in AGENTS.md content", async () => {
   const conn = createConnectionStub();
   const { glm, ref } = captureSystemPrompt();
@@ -2061,12 +2139,14 @@ test("aggregates usage across model calls and counts one usage object per respon
   assert.equal(result.stopReason, "end_turn");
   assert.equal(calls.length, 2);
   assert.deepEqual(result.usage, {
-    inputTokens: 31,
+    inputTokens: 23,
     outputTokens: 13,
     totalTokens: 44,
     cachedReadTokens: 8,
     cachedWriteTokens: 11,
     thoughtTokens: 14,
+    cacheReadInputTokens: 8,
+    cacheCreationInputTokens: 11,
   });
 });
 
@@ -3329,10 +3409,11 @@ test("newSession advertises commands discovered under the session cwd", async ()
     const commands = updates[0]?.update.availableCommands ?? [];
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["deploy"]
+      ["compact", "deploy", "usage"]
     );
-    assert.equal(commands[0]?.description, "Ship the current branch");
-    assert.equal(commands[0]?.input?.hint, "<environment>");
+    const deploy = commands.find((c) => c.name === "deploy");
+    assert.equal(deploy?.description, "Ship the current branch");
+    assert.equal(deploy?.input?.hint, "<environment>");
   } finally {
     cleanup();
   }
@@ -3352,7 +3433,7 @@ test("advertised command names carry no leading slash", async () => {
     const commands = commandUpdates(conn)[0]?.update.availableCommands ?? [];
     assert.deepEqual(
       commands.map((c) => c.name),
-      ["audit", "deploy"]
+      ["audit", "compact", "deploy", "usage"]
     );
     for (const command of commands) {
       assert.ok(!command.name.startsWith("/"), `${command.name} should not start with /`);
@@ -3362,7 +3443,7 @@ test("advertised command names carry no leading slash", async () => {
   }
 });
 
-test("newSession advertises an empty list when the cwd has no commands", async () => {
+test("newSession advertises only built-in commands when the cwd has none", async () => {
   const { cwd, cleanup } = makeTempCwd({ "README.md": "hello" });
   try {
     const conn = createConnectionStub();
@@ -3370,7 +3451,10 @@ test("newSession advertises an empty list when the cwd has no commands", async (
     await agent.newSession({ cwd, mcpServers: [] });
     await flushNotifications();
 
-    assert.deepEqual(commandUpdates(conn)[0]?.update.availableCommands, []);
+    const names = (commandUpdates(conn)[0]?.update.availableCommands ?? []).map(
+      (c) => c.name
+    );
+    assert.deepEqual(names, ["compact", "usage"]);
   } finally {
     cleanup();
   }
@@ -3411,7 +3495,7 @@ test("loadSession advertises commands after replaying history", async () => {
     assert.equal(kinds[kinds.length - 1], "available_commands_update");
     assert.deepEqual(
       commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
-      ["deploy"]
+      ["compact", "deploy", "usage"]
     );
   } finally {
     cleanupCwd();
@@ -3467,7 +3551,7 @@ test("resumeSession advertises commands for the resumed cwd", async () => {
 
     assert.deepEqual(
       commandUpdates(conn)[0]?.update.availableCommands?.map((c) => c.name),
-      ["deploy"]
+      ["compact", "deploy", "usage"]
     );
   } finally {
     cleanupCwd();
@@ -3820,5 +3904,207 @@ test("resumeSession carries the sidecar forward so a later save keeps it", async
   } finally {
     cleanupCwd();
     cleanupStore();
+  }
+});
+
+
+test("built-in /usage command answers locally without a model call", async () => {
+  const { cwd, cleanup } = makeTempCwd({});
+  const conn = createConnectionStub();
+  const glm = makeStreamingGlm([]);
+  const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+  await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+  const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+  // Deterministic lookup: no env key, and a temp XDG root so the
+  // credentials-file fallback cannot find a real one on the host.
+  const previousKey = process.env["Z_AI_API_KEY"];
+  const previousXdg = process.env["XDG_CONFIG_HOME"];
+  delete process.env["Z_AI_API_KEY"];
+  process.env["XDG_CONFIG_HOME"] = cwd;
+  try {
+    const result = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/usage" }],
+    });
+    assert.equal(result.stopReason, "end_turn");
+
+    const chunks = conn.updates
+      .map((u) => u.update as { sessionUpdate: string; content?: { text?: string } })
+      .filter((u) => u.sessionUpdate === "agent_message_chunk")
+      .map((u) => u.content?.text ?? "")
+      .join("");
+    assert.match(chunks, /\[usage\]/);
+  } finally {
+    if (previousKey !== undefined) process.env["Z_AI_API_KEY"] = previousKey;
+    else delete process.env["Z_AI_API_KEY"];
+    if (previousXdg !== undefined) process.env["XDG_CONFIG_HOME"] = previousXdg;
+    else delete process.env["XDG_CONFIG_HOME"];
+    cleanup();
+  }
+});
+
+/** Joined `agent_message_chunk` text a prompt turn emitted. */
+function agentMessageText(conn: ReturnType<typeof createConnectionStub>): string {
+  return conn.updates
+    .map((u) => u.update as { sessionUpdate: string; content?: { text?: string } })
+    .filter((u) => u.sessionUpdate === "agent_message_chunk")
+    .map((u) => u.content?.text ?? "")
+    .join("");
+}
+
+test("built-in /compact replaces history with a model summary and persists it", async () => {
+  const { store, cleanup: cleanupStore } = makeTempStore();
+  const { cwd, cleanup: cleanupCwd } = makeTempCwd({});
+  const glmCalls: Array<{ messages: Array<{ role: string; content?: unknown }>; tools: unknown }> = [];
+  const glm = {
+    async *streamChat(
+      messages: Array<{ role: string; content?: unknown }>,
+      _signal?: AbortSignal,
+      options?: { tools?: unknown }
+    ): AsyncGenerator<GlmStreamChunk> {
+      glmCalls.push({ messages: [...messages], tools: options?.tools });
+      if (glmCalls.length === 3) {
+        yield { text: "**Request** — fix the parser bug." };
+        yield {
+          done: true,
+          stopReason: "stop",
+          usage: { inputTokens: 1000, outputTokens: 40, totalTokens: 1040 },
+        };
+      } else {
+        yield { text: "ok" };
+        yield { done: true, stopReason: "stop" };
+      }
+    },
+  };
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: store });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "fix the bug" }] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "add a test" }] });
+    conn.updates.length = 0;
+
+    const result = await agent.prompt({
+      sessionId,
+      prompt: [{ type: "text", text: "/compact the parser" }],
+    });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(result.usage?.totalTokens, 1040);
+
+    const chunks = agentMessageText(conn);
+    assert.match(chunks, /Compacted 4 messages/);
+    assert.match(chunks, /fix the parser bug/);
+    assert.equal(
+      conn.updates.filter(
+        (u) => (u.update as { sessionUpdate: string }).sessionUpdate === "usage_update"
+      ).length,
+      1
+    );
+
+    // The summary request: full history plus instruction message, no tools.
+    const request = glmCalls[2]!;
+    assert.equal(request.tools, undefined);
+    assert.equal(request.messages.length, 6);
+    const instruction = request.messages[request.messages.length - 1]!;
+    assert.equal(instruction.role, "user");
+    assert.match(String(instruction.content), /focus on: the parser/);
+
+    // History on disk is [system, user(summary)] with a replayable sidecar.
+    const persisted = store.load(sessionId)!;
+    assert.equal(persisted.messages.length, 2);
+    assert.equal(persisted.messages[0]!.role, "system");
+    assert.match(String(persisted.messages[1]!.content), /<summary>/);
+    assert.match(persisted.displayText?.["1"] ?? "", /fix the parser bug/);
+
+    const replayConn = createConnectionStub();
+    const reopened = new GlmAcpAgent(replayConn as never, { glm, sessionStore: store });
+    await reopened.loadSession({ sessionId, cwd, mcpServers: [] });
+    const replayed = replayedUserTexts(replayConn);
+    assert.equal(replayed.length, 1);
+    assert.match(replayed[0]!, /Session compacted at/);
+    assert.match(replayed[0]!, /fix the parser bug/);
+  } finally {
+    cleanupCwd();
+    cleanupStore();
+  }
+});
+
+test("built-in /compact failure keeps the original history", async () => {
+  const { cwd, cleanup } = makeTempCwd({});
+  const glmCalls: Array<Array<{ role: string }>> = [];
+  const glm = {
+    async *streamChat(messages: Array<{ role: string }>): AsyncGenerator<GlmStreamChunk> {
+      glmCalls.push(messages.map((m) => ({ role: m.role })));
+      if (glmCalls.length === 2) throw new Error("provider 500");
+      yield { text: "ok" };
+      yield { done: true, stopReason: "stop" };
+    },
+  };
+  try {
+    const conn = createConnectionStub();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "hello" }] });
+    conn.updates.length = 0;
+
+    const failed = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/compact" }] });
+    assert.equal(failed.stopReason, "end_turn");
+    assert.match(agentMessageText(conn), /\[compact\] failed: provider 500 — history unchanged/);
+
+    // Nothing was compacted away: the next turn still sees every message.
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "still here" }] });
+    assert.deepEqual(glmCalls[2], [
+      { role: "system" },
+      { role: "user" },
+      { role: "assistant" },
+      { role: "user" },
+    ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("built-in /compact on an empty session answers without a model call", async () => {
+  const { cwd, cleanup } = makeTempCwd({});
+  try {
+    const conn = createConnectionStub();
+    const glm = makeStreamingGlm([]);
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    await agent.initialize({ protocolVersion: PROTOCOL_VERSION, clientCapabilities: {} });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+
+    const result = await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/compact" }] });
+    assert.equal(result.stopReason, "end_turn");
+    assert.equal(agentMessageText(conn), "[compact] nothing to compact\n");
+  } finally {
+    cleanup();
+  }
+});
+
+test("a project compact.md shadows the built-in /compact", async () => {
+  const { cwd, cleanup } = makeTempCwd({
+    ".claude/commands/compact.md":
+      "---\ndescription: Custom compaction\n---\nRun the custom playbook.\n",
+  });
+  try {
+    const conn = createConnectionStub();
+    const { glm, ref } = captureUserMessage();
+    const agent = new GlmAcpAgent(conn as never, { glm, sessionStore: null });
+    const { sessionId } = await agent.newSession({ cwd, mcpServers: [] });
+    await flushNotifications();
+
+    const commands = commandUpdates(conn)[0]?.update.availableCommands ?? [];
+    const compact = commands.filter((c) => c.name === "compact");
+    assert.equal(compact.length, 1);
+    assert.equal(compact[0]?.description, "Custom compaction");
+
+    await agent.prompt({ sessionId, prompt: [{ type: "text", text: "/compact now" }] });
+    assert.match(ref.value, /<slash_command name="compact"/);
+    assert.match(ref.value, /Run the custom playbook\./);
+  } finally {
+    cleanup();
   }
 });

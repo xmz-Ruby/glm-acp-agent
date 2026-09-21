@@ -129,6 +129,24 @@ the user message, substituting `$ARGUMENTS` where the file asks for it and other
 appending the typed arguments. Unknown `/foo` is left untouched and reaches the model
 as prose, so typing a slash by accident never fails the turn.
 
+### Built-in commands
+
+Two commands ship in the agent itself and need no definition file:
+
+- `/usage` — shows GLM Coding Plan quota (5-hour window, weekly, MCP). Answers
+  locally; no model call.
+- `/compact [focus]` — asks the model once, with no tools, to summarize the
+  whole conversation (request, key decisions, files changed, current state,
+  next steps), then replaces the history with `[system, user(summary)]` and
+  persists immediately, so a context gauge falls on the same turn. Free text
+  after the command is passed to the model as the summary's focus. If the
+  summary call fails or times out (120 s), the original history is kept and
+  the error is reported in-band.
+
+A `.claude/commands/compact.md` (or `usage.md`) in the project or `~/.claude`
+shadows the built-in of the same name: the file definition wins and the prompt
+reaches the model as an ordinary slash-command expansion.
+
 ---
 
 ## Prerequisites

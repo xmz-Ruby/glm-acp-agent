@@ -286,3 +286,50 @@ export function renderSlashCommand(parsed: ParsedSlashCommand): string {
   lines.push("</slash_command>");
   return lines.join("\n");
 }
+
+// ---------------------------------------------------------------------------
+// Built-in commands
+// ---------------------------------------------------------------------------
+
+/**
+ * Commands the agent executes itself, outside the prompt loop. They advertise
+ * in the same `available_commands_update` list as file commands and are
+ * invoked the same way (`/name` as prompt text), but `agent.ts` intercepts
+ * them before the prompt loop. Most answer from local data with no model
+ * call; `compact` is the one exception — it makes a single tool-free model
+ * call to produce the summary it replaces the history with.
+ *
+ * `body` stays empty: built-ins never expand into model instructions.
+ */
+export const BUILTIN_COMMANDS: SlashCommand[] = [
+  {
+    name: "usage",
+    description:
+      "Show GLM Coding Plan quota (5-hour / weekly / MCP) — runs locally, no model call",
+    body: "",
+    source: "builtin",
+  },
+  {
+    name: "compact",
+    description:
+      "Summarize the conversation and replace history with the summary — one model call, no tools",
+    argumentHint: "optional: what the summary should focus on",
+    body: "",
+    source: "builtin",
+  },
+];
+
+/** Whether a command instance is one of {@link BUILTIN_COMMANDS}. */
+export function isBuiltinCommand(command: SlashCommand): boolean {
+  return command.source === "builtin";
+}
+
+/**
+ * File-discovered commands plus the built-ins. A same-named file command wins,
+ * matching the "project overrides user" precedence the discovery roots use.
+ */
+export function discoverSessionCommands(cwd: string): SlashCommand[] {
+  const merged = new Map(BUILTIN_COMMANDS.map((command) => [command.name, command]));
+  for (const command of discoverSlashCommands(cwd)) merged.set(command.name, command);
+  return [...merged.values()].sort((a, b) => a.name.localeCompare(b.name));
+}

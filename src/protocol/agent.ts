@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join as pathJoin } from "node:path";
+import { homedir } from "node:os";
 import type { ChatCompletionContentPart } from "openai/resources/index.js";
 import type {
   Agent,
@@ -61,14 +62,17 @@ import { SessionLifecycle, type TransitionLease } from "./session-lifecycle.js";
 import { checkModelTransition } from "./model-transition.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import {
-  discoverSlashCommands,
+  discoverSessionCommands,
+  isBuiltinCommand,
   parseSlashCommand,
   renderSlashCommand,
+  type ParsedSlashCommand,
   type SlashCommand,
 } from "./slash-commands.js";
 import { preprocessImageBlocks, buildPromptBlockDiagnosticLines } from "./image-preprocessor.js";
 import { StdioVisionMcpClient, type VisionMcpClient } from "../tools/vision-mcp-client.js";
 import { resolveApiKey } from "../llm/credentials.js";
+import { fetchPlanUsage, formatPlanUsage } from "../llm/plan-usage.js";
 import { debug, error, isDebugEnabled } from "../llm/logger.js";
 import { validateStreamCompletion } from "../llm/stream-state.js";
 import {
@@ -88,6 +92,13 @@ import {
  * files in their AGENTS.md.
  */
 const PROJECT_CONTEXT_CAP_CHARS = 8 * 1024;
+
+/**
+ * Ceiling on the `/compact` summary call. Summarizing a near-full history can
+ * take a long time to first token, but the command must fail in-band and keep
+ * the history rather than hang the turn forever when the provider stalls.
+ */
+const COMPACT_SUMMARY_TIMEOUT_MS = 120_000;
 
 /**
  * ACP session mode identifiers. These control when the agent requests user
@@ -364,7 +375,7 @@ export class GlmAcpAgent implements Agent {
       protocolVersion: negotiatedVersion,
       agentInfo: {
         name: "glm-acp-agent",
-        version: "1.0.0",
+        version: "1.13.0-fork.1",
       },
       // Advertise auth methods so the ACP registry verifier and capable
       // clients can discover how to configure us. The `agent`-default method
@@ -478,7 +489,7 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: "default",
       thoughtLevel,
-      commands: discoverSlashCommands(params.cwd),
+      commands: discoverSessionCommands(params.cwd),
       displayText: new WeakMap(),
       lifecycle,
       });
@@ -874,6 +885,70 @@ export class GlmAcpAgent implements Agent {
           debug(line);
         }
       }
+      // What the user typed, rendered from the blocks as they arrived — before
+      // command expansion and image analysis rewrote them for the model. Kept
+      // separately so `session/load` replays the conversation the user had.
+      const displayText = renderPromptBlocks(params.prompt).plainText;
+
+      // Built-in commands run outside the prompt loop — no history entry, and
+      // no model call except for compact, which summarizes the history it is
+      // about to replace. The turn ends as soon as their text is out.
+      const builtin = parseBuiltinCommand(displayText, session.commands);
+      if (builtin) {
+        const outcome =
+          builtin.command.name === "compact"
+            ? await this.runCompactCommand(session, builtin.args, abortController.signal)
+            : {
+                text: await this.runBuiltinCommand(builtin.command, abortController.signal),
+                compacted: false as const,
+                usage: undefined,
+              };
+        if (!ownsPrompt() || abortController.signal.aborted) return cancelledResponse();
+        if (session.abortController === abortController) session.abortController = null;
+        session.updatedAt = new Date().toISOString();
+        const titleUpdate: { title?: string } =
+          session.title === null
+            ? (() => {
+                const derived = displayText.slice(0, 80).replace(/\s+/g, " ").trim();
+                session.title = derived.length > 0 ? derived : "New conversation";
+                return { title: session.title };
+              })()
+            : {};
+        await safeSessionUpdate(this.connection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "session_info_update",
+            updatedAt: session.updatedAt,
+            ...titleUpdate,
+          },
+        });
+        await safeSessionUpdate(this.connection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: outcome.text + "\n" },
+          },
+        });
+        if (outcome.compacted) {
+          // Report occupancy on the same turn so a context gauge (Codeg's
+          // session footer) falls immediately, and get the rewritten history
+          // to disk before a resume or fork can resurrect the old one.
+          await safeSessionUpdate(this.connection, {
+            sessionId: params.sessionId,
+            update: {
+              sessionUpdate: "usage_update",
+              size: getContextWindow(session.model),
+              used: estimateMessagesTokens(session.messages),
+            },
+          });
+          this.persistSession(params.sessionId, session);
+        }
+        const builtinResponse: PromptResponse = { stopReason: "end_turn" };
+        if (outcome.usage) builtinResponse.usage = withCacheAliases(outcome.usage);
+        if (userMessageId) builtinResponse.userMessageId = userMessageId;
+        return builtinResponse;
+      }
+
       // Clients invoke an advertised command by sending `/name …` as ordinary
       // prompt text, so expand it here into the instructions its definition
       // holds. Unknown `/foo` is left alone and reaches the model as prose.
@@ -895,10 +970,6 @@ export class GlmAcpAgent implements Agent {
       const userMessage: GlmMessage = { role: "user", content: userContent };
       session.messages.push(userMessage);
 
-      // What the user typed, rendered from the blocks as they arrived — before
-      // command expansion and image analysis rewrote them for the model. Kept
-      // separately so `session/load` replays the conversation the user had.
-      const displayText = renderPromptBlocks(params.prompt).plainText;
       if (displayText !== stringifyUserMessage(userContent)) {
         session.displayText.set(userMessage, displayText);
       }
@@ -941,10 +1012,24 @@ export class GlmAcpAgent implements Agent {
         },
       });
 
+      // ACP's experimental usage channel: context occupancy for clients that
+      // render a context-window gauge (Codeg's session footer, for one). Token
+      // totals travel separately on the prompt response's `usage` field.
+      if (usage) {
+        await safeSessionUpdate(this.connection, {
+          sessionId: params.sessionId,
+          update: {
+            sessionUpdate: "usage_update",
+            size: getContextWindow(session.model),
+            used: estimateMessagesTokens(session.messages),
+          },
+        });
+      }
+
       this.persistSession(params.sessionId, session);
 
       const response: PromptResponse = { stopReason };
-      if (usage) response.usage = usage;
+      if (usage) response.usage = withCacheAliases(usage);
       if (userMessageId) response.userMessageId = userMessageId;
       return response;
     } catch (err) {
@@ -1296,7 +1381,7 @@ export class GlmAcpAgent implements Agent {
       mcpTools,
       mode: persisted.mode,
       thoughtLevel: resolveThoughtLevel(persisted.model, persisted.thoughtLevel ?? "max"),
-      commands: discoverSlashCommands(params.cwd),
+      commands: discoverSessionCommands(params.cwd),
       // Re-key onto the cloned messages: the parent's map is keyed by the
       // originals, which the fork no longer holds.
       displayText: deserializeRestoredDisplayText(
@@ -1424,7 +1509,7 @@ export class GlmAcpAgent implements Agent {
           mcpTools: provisional,
           mode: restoreSource.mode,
           thoughtLevel: resolveThoughtLevel(restoreSource.model, restoreSource.thoughtLevel ?? "max"),
-          commands: discoverSlashCommands(params.cwd),
+          commands: discoverSessionCommands(params.cwd),
           displayText: deserializeRestoredDisplayText(
             restoreSource.messages,
             restoredMessages,
@@ -1768,6 +1853,110 @@ export class GlmAcpAgent implements Agent {
    *
    * Returns the ACP stop reason and optional token usage reported by the model.
    */
+  /**
+   * Execute a built-in command locally and return the text to message back.
+   * No model call happens on this path; the caller ends the turn immediately
+   * after emitting the text. Errors are rendered into the reply so the user
+   * sees them in-band instead of a JSON-RPC failure.
+   */
+  private async runBuiltinCommand(
+    command: SlashCommand,
+    signal?: AbortSignal
+  ): Promise<string> {
+    if (command.name !== "usage") {
+      return `[${command.name}] unknown built-in command`;
+    }
+    const apiKey = resolveApiKey();
+    if (!apiKey) {
+      return "[usage] no API key configured (set Z_AI_API_KEY or run `glm-acp-agent --setup`)";
+    }
+    try {
+      return formatPlanUsage(await fetchPlanUsage(apiKey, signal));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return `[usage] query failed: ${message}`;
+    }
+  }
+
+  /**
+   * `/compact` — the one built-in that needs the model: it asks the session's
+   * model, with no tools, to summarize the whole history, then replaces the
+   * history with `[system, user(summary)]` so the next request starts from the
+   * summary alone. Any failure — provider error, timeout, empty summary —
+   * leaves the history untouched and is reported in-band like `/usage` errors.
+   */
+  private async runCompactCommand(
+    session: SessionState,
+    args: string,
+    signal: AbortSignal
+  ): Promise<{ text: string; compacted: boolean; usage?: Usage }> {
+    const system = session.messages[0]?.role === "system" ? [session.messages[0]!] : [];
+    if (session.messages.length === system.length) {
+      return { text: "[compact] nothing to compact", compacted: false };
+    }
+    const beforeMessages = session.messages.length - system.length;
+    const beforeTokens = estimateMessagesTokens(session.messages);
+
+    const focus = args.trim();
+    const instructions = [
+      "Summarize the conversation above so that work can continue with this summary alone as the record of what happened.",
+      "Write the summary in the primary language of the conversation.",
+      "Cover, as short markdown sections:",
+      "1. **Request** — the user's original task and any later refinements;",
+      "2. **Key decisions** — choices made and why;",
+      "3. **Files changed** — paths and what changed in each;",
+      "4. **Current state** — what works, what is unfinished, errors encountered;",
+      "5. **Next steps** — the immediate actions to take next.",
+      "Keep the summary under ~800 words. Preserve file paths, commands, and identifiers verbatim.",
+      ...(focus.length > 0 ? [`The user asked the summary to focus on: ${focus}`] : []),
+    ].join("\n");
+
+    const timeoutSignal = AbortSignal.timeout(COMPACT_SUMMARY_TIMEOUT_MS);
+    const requestSignal = AbortSignal.any([signal, timeoutSignal]);
+    let summary = "";
+    let usage: Usage | undefined;
+    try {
+      for await (const chunk of this.glm.streamChat(
+        [...session.messages, { role: "user", content: instructions }],
+        requestSignal,
+        { model: session.model, reasoningEffort: session.thoughtLevel }
+      )) {
+        if (chunk.text) summary += chunk.text;
+        if (chunk.usage) usage = chunk.usage;
+      }
+    } catch (err) {
+      if (signal.aborted) throw err;
+      const reason = timeoutSignal.aborted
+        ? `summary timed out after ${COMPACT_SUMMARY_TIMEOUT_MS / 1000}s`
+        : err instanceof Error
+          ? err.message
+          : String(err);
+      return { text: `[compact] failed: ${reason} — history unchanged`, compacted: false };
+    }
+    if (signal.aborted) throw new Error("compact cancelled");
+    summary = summary.trim();
+    if (summary.length === 0) {
+      return { text: "[compact] failed: empty summary — history unchanged", compacted: false };
+    }
+
+    const header = `[Session compacted at ${new Date().toISOString()}: ${beforeMessages} messages (~${beforeTokens} estimated tokens) replaced by the summary below.]`;
+    const summaryMessage: GlmMessage = {
+      role: "user",
+      content: `${header}\n\n<summary>\n${summary}\n</summary>\n\nTreat the summary above as the sole record of the earlier conversation and continue from it.`,
+    };
+    const messages = [...system, summaryMessage];
+    assertValidHistory(messages);
+    session.messages = messages;
+    // The model-facing wrapper is instructions, not what the user said; keep
+    // replay showing the header plus the summary itself.
+    session.displayText.set(summaryMessage, `${header}\n\n${summary}`);
+    return {
+      text: `Compacted ${beforeMessages} messages (~${beforeTokens} → ~${estimateMessagesTokens(messages)} estimated tokens).\n\n${summary}`,
+      compacted: true,
+      usage,
+    };
+  }
+
   private async runPromptLoop(
     sessionId: string,
     session: SessionState,
@@ -2435,6 +2624,15 @@ function availableCommandsState(
  * advertised command. The caller keeps the original blocks around to derive
  * the replay/title text, so nothing here needs to report the typed form back.
  */
+/** Parse prompt text into a built-in command invocation, if it is one. */
+function parseBuiltinCommand(
+  text: string,
+  commands: ReadonlyArray<SlashCommand>
+): ParsedSlashCommand | undefined {
+  const parsed = parseSlashCommand(text, commands);
+  return parsed && isBuiltinCommand(parsed.command) ? parsed : undefined;
+}
+
 function expandPromptCommand(
   blocks: PromptRequest["prompt"],
   commands: ReadonlyArray<SlashCommand>
@@ -2452,28 +2650,69 @@ function expandPromptCommand(
 }
 
 /**
- * Read an `AGENTS.md` (preferred) or `CLAUDE.md` from the session's cwd, returning
- * its contents capped to {@link PROJECT_CONTEXT_CAP_CHARS} characters. Read errors
- * (file missing, no permission, directory missing) are intentionally swallowed —
- * project context is optional, and a missing file is the common case.
+ * Read a global `~/.codeg/AGENTS.md` plus an `AGENTS.md` (preferred) or
+ * `CLAUDE.md` from the session's cwd, each capped to
+ * {@link PROJECT_CONTEXT_CAP_CHARS} characters. When both exist they are
+ * concatenated — global first, then the project file — and travel under the
+ * one untrusted-context wrapper `renderProjectContext` applies. The global
+ * file exists because Codeg opens sessions in a throwaway directory that has
+ * no AGENTS.md at all; user-level rules live there instead.
+ *
+ * Read errors (file missing, no permission, directory missing) are
+ * intentionally swallowed — context is optional, and a missing file is the
+ * common case.
  *
  * Called once at `newSession` time (not per prompt) so the project context is
  * stable across the conversation.
  */
 function loadProjectContext(cwd: string): string | undefined {
-  for (const filename of ["AGENTS.md", "CLAUDE.md"] as const) {
+  const readCapped = (path: string): string | undefined => {
     let contents: string;
     try {
-      contents = readFileSync(pathJoin(cwd, filename), { encoding: "utf-8" });
+      contents = readFileSync(path, { encoding: "utf-8" });
     } catch {
-      continue;
+      return undefined;
     }
-    if (contents.length > PROJECT_CONTEXT_CAP_CHARS) {
-      contents = contents.slice(0, PROJECT_CONTEXT_CAP_CHARS);
-    }
-    return contents;
-  }
-  return undefined;
+    return contents.length > PROJECT_CONTEXT_CAP_CHARS
+      ? contents.slice(0, PROJECT_CONTEXT_CAP_CHARS)
+      : contents;
+  };
+  const globalContents = readCapped(pathJoin(homedir(), ".codeg", "AGENTS.md"));
+  const localContents = ["AGENTS.md", "CLAUDE.md"]
+    .map((filename) => readCapped(pathJoin(cwd, filename)))
+    .find((contents) => contents !== undefined);
+  const merged = [globalContents, localContents]
+    .filter((part) => part !== undefined)
+    .join("\n\n");
+  return merged.length > 0 ? merged : undefined;
+}
+
+/**
+ * Clients that read cache counters off the prompt response under the newer
+ * `unstable_session_usage` field names (Codeg expects
+ * `cacheReadInputTokens` / `cacheCreationInputTokens` and computes cache hit
+ * rate as cache_read / (input + cache_write + cache_read)) need
+ * `inputTokens` to EXCLUDE cached tokens. This SDK (0.20.0) still names them
+ * `cachedReadTokens` / `cachedWriteTokens`, and GLM's OpenAI-style
+ * `prompt_tokens` includes the cached portion. Emit both names and split the
+ * cached read out of `inputTokens`; clients that don't know the extra fields
+ * ignore them.
+ */
+function withCacheAliases(usage: Usage): Usage {
+  const cachedRead =
+    typeof usage.cachedReadTokens === "number" ? usage.cachedReadTokens : null;
+  const cachedWrite =
+    typeof usage.cachedWriteTokens === "number" ? usage.cachedWriteTokens : null;
+  if (cachedRead == null && cachedWrite == null) return usage;
+  return {
+    ...usage,
+    inputTokens:
+      cachedRead != null
+        ? Math.max(0, usage.inputTokens - cachedRead)
+        : usage.inputTokens,
+    cacheReadInputTokens: cachedRead ?? 0,
+    cacheCreationInputTokens: cachedWrite ?? 0,
+  } as Usage;
 }
 
 /** sessionUpdate that swallows transport errors during error reporting. */

@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
+// The global ~/.codeg/AGENTS.md must not leak the host user's real file into
+// these tests: point the home directory at an isolated tempdir.
+const isolatedHome = mkdtempSync(join(tmpdir(), "glm-acp-test-home-"));
+process.env["HOME"] = isolatedHome;
+// os.homedir() uses USERPROFILE on Windows, where HOME is not authoritative.
+process.env["USERPROFILE"] = isolatedHome;
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
