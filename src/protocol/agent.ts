@@ -57,6 +57,7 @@ import { ToolExecutor, type TodoItem } from "../tools/executor.js";
 import { ProcessSupervisor } from "../tools/process-supervisor.js";
 import { TOOL_DEFINITIONS, type ToolDefinition } from "../tools/definitions.js";
 import { connectSessionMcpServers, type SessionMcpTools } from "../tools/session-mcp-client.js";
+import { mergeUserConfigMcpServers } from "../tools/user-config-mcp.js";
 import { SessionStore, type PersistedSession } from "./session-store.js";
 import { SessionLifecycle, type TransitionLease } from "./session-lifecycle.js";
 import { checkModelTransition } from "./model-transition.js";
@@ -334,7 +335,14 @@ export class GlmAcpAgent implements Agent {
     this.visionClientExplicit = "visionClient" in options;
     this._visionClient = options.visionClient ?? null;
     this.sessionDrainTimeoutMs = options.sessionDrainTimeoutMs ?? 30_000;
-    this.mcpConnector = options.mcpConnector ?? options.connectSessionMcpServers ?? connectSessionMcpServers;
+    const explicitConnector = options.mcpConnector ?? options.connectSessionMcpServers ?? null;
+    // fork: with the default connector, merge MCP servers from
+    // ~/.glm/acp-mcp.json under the wire-provided list (wire wins by name)
+    // on every session setup path. An injected connector (tests) is used
+    // verbatim so it stays hermetic against the user's config.
+    this.mcpConnector = explicitConnector
+      ? explicitConnector
+      : (servers, signal) => connectSessionMcpServers(mergeUserConfigMcpServers(servers), signal);
     this.connectMcpServers = this.mcpConnector;
     this.shutdownDrainTimeoutMs = options.shutdownDrainTimeoutMs ?? 4_000;
     this.streamThinking = process.env["ACP_GLM_STREAM_THINKING"]?.toLowerCase() !== "false";
